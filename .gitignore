@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+.venv/
+work/
+build/
+dist/
+*.spec
+*.exe
+*.zip
+*.sqlite*
+auth.json
+settings.json
+sessions/
+archived_sessions/
+objects/
+backups/
+latest.json
