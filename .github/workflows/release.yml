@@ -1,0 +1,88 @@
+name: Build Windows release
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - handoff.py
+      - handoff_ui.py
+      - tests/**
+      - resources/**
+      - requirements-build.txt
+      - build.ps1
+      - .github/workflows/release.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Run isolated regression tests
+        run: python -m unittest discover -s tests -p "test_*.py" -v
+      - name: Build portable executable
+        shell: pwsh
+        run: |
+          python -m pip install -r requirements-build.txt
+          if ($LASTEXITCODE -ne 0) { throw 'Build dependency installation failed.' }
+          python -m PyInstaller --noconfirm --onefile --windowed --name CodexHandoff --icon resources/handoff.ico --add-data 'resources;resources' handoff.py
+          if ($LASTEXITCODE -ne 0) { throw 'Build failed.' }
+      - name: Verify executable and prepare package
+        shell: pwsh
+        run: |
+          $taskVersion = python -c 'import handoff; print(handoff.VERSION)'
+          $taskRuntime = Start-Process -FilePath '.\dist\CodexHandoff.exe' -ArgumentList '--self-test', 'runtime-check.json' -WindowStyle Hidden -Wait -PassThru
+          if ($taskRuntime.ExitCode -ne 0) { throw 'Runtime self-test failed.' }
+          $taskReport = Get-Content -Raw -LiteralPath runtime-check.json | ConvertFrom-Json
+          if ($taskReport.version -ne $taskVersion) { throw 'Packaged version mismatch.' }
+          $taskUi = Start-Process -FilePath '.\dist\CodexHandoff.exe' -ArgumentList '--ui-smoke-test', 'ui-check.json' -WindowStyle Hidden -Wait -PassThru
+          if ($taskUi.ExitCode -ne 0) { throw 'UI smoke test failed.' }
+          New-Item -ItemType Directory -Path 'release-package\CodexHandoff\tests','release-package\CodexHandoff\resources' -Force | Out-Null
+          Copy-Item -LiteralPath dist/CodexHandoff.exe,handoff.py,handoff_ui.py,README.md,CHANGELOG.md,build.ps1,requirements-build.txt -Destination release-package/CodexHandoff
+          Copy-Item -LiteralPath 'docs/使用说明.md','docs/验证记录.md' -Destination release-package/CodexHandoff
+          Copy-Item -Path 'tests/test_*.py' -Destination release-package/CodexHandoff/tests
+          Copy-Item -LiteralPath resources/handoff.ico -Destination release-package/CodexHandoff/resources
+          $taskRoot = (Resolve-Path release-package/CodexHandoff).Path
+          $taskHashes = Get-ChildItem -LiteralPath $taskRoot -Recurse -File | Sort-Object FullName | ForEach-Object {
+            $taskRel = [System.IO.Path]::GetRelativePath($taskRoot, $_.FullName).Replace('\','/')
+            (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant() + '  ' + $taskRel
+          }
+          $taskHashes | Set-Content -LiteralPath release-package/CodexHandoff/SHA256SUMS.txt -Encoding utf8NoBOM
+          $taskArchive = "CodexHandoff-v$taskVersion-windows-x64.zip"
+          Compress-Archive -LiteralPath release-package/CodexHandoff -DestinationPath $taskArchive
+          $taskArchiveHash = (Get-FileHash -LiteralPath $taskArchive -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$taskArchiveHash  $taskArchive" | Set-Content -LiteralPath "$taskArchive.sha256" -Encoding utf8NoBOM
+          "RELEASE_VERSION=$taskVersion" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "RELEASE_ARCHIVE=$taskArchive" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Publish prerelease
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $taskTag = "v$env:RELEASE_VERSION"
+          gh release view $taskTag --repo $env:GITHUB_REPOSITORY *> $null
+          if ($LASTEXITCODE -eq 0) {
+            throw "Release $taskTag already exists; bump VERSION before publishing again."
+          }
+          $taskNotes = @"
+          修复跨电脑接收后部分历史对话打不开的 Windows 扩展路径问题，并修复普通 ChatGPT 后台进程误拦截。
+
+          37 项隔离回归测试通过。便携 EXE 已通过版本自检与隐藏窗口界面构造检查。
+
+          下载 ZIP 后解压，双击 CodexHandoff.exe。两台电脑都应更新。接收仍按整套快照替换，本机独有聊天会先进入自动备份，不会自动合并。
+
+          这是预发布版，真实双机续聊仍需按使用说明做 A → B → A 往返验收。
+          "@
+          $taskNotes | Set-Content -LiteralPath release-notes.md -Encoding utf8NoBOM
+          gh release create $taskTag $env:RELEASE_ARCHIVE "$env:RELEASE_ARCHIVE.sha256" --repo $env:GITHUB_REPOSITORY --target $env:GITHUB_SHA --title "Codex 交接助手 $taskTag" --notes-file release-notes.md --prerelease
+          if ($LASTEXITCODE -ne 0) { throw 'Release publication failed.' }

@@ -247,7 +247,7 @@ class HandoffApp:
         self.update_controls()
         if not self.busy:
             self.set_status("准备导出" if exporting else "准备接收",
-                            "选择中转文件夹。开始前请先退出 Codex、ChatGPT 桌面程序和 CLI。")
+                            "选择中转文件夹。开始前请先完全退出 Codex 和 CLI（包括托盘后台）。")
 
     def set_status(self, title, detail, color=INK):
         self.status_title.configure(text=title, fg=color)
@@ -340,6 +340,8 @@ class HandoffApp:
         except Exception as exc:
             self.append_log(str(exc))
             self.set_status("暂时无法开始", str(exc), AMBER)
+            if not self.details_open:
+                self.toggle_details()
             return
         self.busy = True
         self.count = 0

@@ -7,7 +7,7 @@ import hashlib
 import io
 import json
 import os
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 import re
 import shutil
 import socket
@@ -18,7 +18,7 @@ import threading
 import uuid
 from datetime import datetime, timezone
 
-VERSION = "1.1.0"
+VERSION = "1.1.2"
 DBS = {"state_5.sqlite", "thread_history_1.sqlite"}
 DIRS = {"sessions", "archived_sessions", "generated_images", "visualizations"}
 SINGLE = {"session_index.jsonl", ".codex-global-state.json"}
@@ -88,18 +88,82 @@ def safe_file(root, relative):
     return dest
 
 
+def process_image_path(pid):
+    """Read the actual executable; None means the process has already exited."""
+    import ctypes
+    from ctypes import wintypes
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel.OpenProcess.restype = wintypes.HANDLE
+    kernel.QueryFullProcessImageNameW.argtypes = [wintypes.HANDLE, wintypes.DWORD,
+                                                wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)]
+    kernel.QueryFullProcessImageNameW.restype = wintypes.BOOL
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel.CloseHandle.restype = wintypes.BOOL
+    handle = kernel.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+    if not handle:
+        error = ctypes.get_last_error()
+        if error in {87, 1168}:  # Exited between tasklist and OpenProcess.
+            return None
+        raise ctypes.WinError(error)
+    try:
+        size = wintypes.DWORD(32768)
+        buffer = ctypes.create_unicode_buffer(size.value)
+        if not kernel.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(size)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        return buffer.value
+    finally:
+        kernel.CloseHandle(handle)
+
+
+def chatgpt_product(path):
+    """Codex also ships ChatGPT.exe. Only allow positively identified ChatGPT installs."""
+    parts = [p.casefold() for p in PureWindowsPath(path).parts[:-1]]
+    if any(p == "codex" or p.startswith("openai.codex_") for p in parts):
+        return "codex"
+    if any(p == "chatgpt" or p.startswith(("openai.chatgpt_", "openai.chatgpt-desktop_"))
+           for p in parts):
+        return "chatgpt"
+    return "unknown"
+
+
 def offline_guard():
     if os.name != "nt":
         raise HandoffError("此工具只支持 Windows。")
-    result = subprocess.run(["tasklist", "/FO", "CSV", "/NH"], check=True,
-                            capture_output=True, creationflags=0x08000000)
-    names = {r[0].lower() for r in csv.reader(io.StringIO(
-        result.stdout.decode("mbcs", errors="replace"))) if r}
-    busy = names & {"codex.exe", "chatgpt.exe", "codex-cli.exe", "codex-app.exe",
-                    "codex-desktop.exe", "codex-executor.exe"}
+    try:
+        result = subprocess.run(["tasklist", "/FO", "CSV", "/NH"], check=True,
+                                capture_output=True, creationflags=0x08000000, timeout=10)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise HandoffError("无法检查运行中的程序，请稍后重试。") from exc
+    busy, unknown = [], []
+    candidates = {"codex.exe", "chatgpt.exe", "codex-cli.exe", "codex-app.exe",
+                  "codex-desktop.exe", "codex-executor.exe"}
+    for row in csv.reader(io.StringIO(result.stdout.decode("mbcs", errors="replace"))):
+        if not row or row[0].casefold() not in candidates:
+            continue
+        name = row[0]
+        if len(row) < 2 or not row[1].isdigit():
+            raise HandoffError("进程检查结果无效，请稍后重试。")
+        pid = int(row[1])
+        try:
+            path = process_image_path(pid)
+        except OSError:
+            path = "（无法读取程序路径）"
+        if path is None:
+            continue
+        product = chatgpt_product(path) if name.casefold() == "chatgpt.exe" else "codex"
+        if product == "chatgpt":
+            continue
+        detail = f"{name}（PID {pid}）\n程序路径：{path}"
+        (unknown if product == "unknown" else busy).append(detail)
     if busy:
-        raise HandoffError("请先结束任务，完全退出 Codex / ChatGPT 桌面程序和 Codex CLI。\n"
-                           "仍在运行：" + ", ".join(sorted(busy)))
+        raise HandoffError("检测到 Codex 仍在运行（可能开机自启或驻留后台）。\n"
+                           "请结束任务后，从托盘或菜单完全退出 Codex 和 CLI，再重试。\n"
+                           "Codex 的进程名也可能是 ChatGPT.exe。\n" + "\n".join(busy + unknown))
+    if unknown:
+        raise HandoffError("无法确认以下进程是否属于 Codex，请查看操作详情中的程序路径，"
+                           "退出对应程序后重试。\n" + "\n".join(unknown))
 
 
 def sqlite_open(path):
@@ -182,12 +246,21 @@ def check_project_location(path, home, data):
         raise HandoffError("项目文件夹不能位于 Codex、工具数据或系统目录内。")
 
 
+def plain_windows_path(value):
+    normalized = str(value).replace("/", "\\")
+    if normalized[:8].casefold() == "\\\\?\\unc\\".casefold():
+        return "\\\\" + normalized[8:]
+    if normalized.startswith("\\\\?\\"):
+        return normalized[4:]
+    return normalized
+
+
 def map_path(value, mappings):
     if not isinstance(value, str):
         return value
-    normalized = value.replace("/", "\\")
-    for old, new in sorted(mappings, key=lambda x: -len(str(x[0]))):
-        old = str(old).replace("/", "\\").rstrip("\\")
+    normalized = plain_windows_path(value)
+    for old, new in sorted(mappings, key=lambda x: -len(plain_windows_path(x[0]))):
+        old = plain_windows_path(old).rstrip("\\")
         if normalized.casefold() == old.casefold():
             return str(new)
         if normalized.casefold().startswith(old.casefold() + "\\"):

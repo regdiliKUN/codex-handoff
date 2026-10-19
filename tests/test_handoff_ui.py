@@ -101,6 +101,8 @@ class InterfaceTests(unittest.TestCase):
         self.assertEqual(self.app.status_title.cget('text'), '暂时无法开始')
         self.assertIn('退出 Codex', self.app.status_detail.cget('text'))
         self.assertEqual(self.engine.export_calls, 0)
+        self.assertTrue(self.app.details_open)
+        self.assertIn('退出 Codex', self.app.log.get('1.0', 'end'))
 
     def test_busy_locks_controls_then_success_is_clear(self):
         self.app.store.set(str(self.base / 'transfer'))

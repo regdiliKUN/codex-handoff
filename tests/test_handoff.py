@@ -3,6 +3,7 @@ import importlib.util
 import json
 from pathlib import Path
 import sqlite3
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -90,6 +91,37 @@ class HandoffTests(unittest.TestCase):
         with self.assertRaises(h.HandoffError):
             self.b.receive(self.store)
         self.assertFalse(self.b.home.exists())
+
+    def test_extended_windows_paths_map_to_current_profile(self):
+        mappings = [(r'C:\Users\olduser\.codex', r'C:\Users\New User\.codex'),
+                    (r'C:\Users\olduser', r'C:\Users\New User')]
+        for prefix in ['', '\\\\?\\']:
+            self.assertEqual(h.map_path(prefix + r'C:\Users\olduser\.codex\sessions\one.jsonl', mappings),
+                             r'C:\Users\New User\.codex\sessions\one.jsonl')
+            self.assertEqual(h.map_path(prefix + r'C:\Users\olduser\Documents\project', mappings),
+                             r'C:\Users\New User\Documents\project')
+        self.assertEqual(h.map_path(r'\\?\C:\Users\olduser2\file', mappings),
+                         r'\\?\C:\Users\olduser2\file')
+        self.assertEqual(h.map_path(r'C:\Users\old\file', [(r'\\?\C:\Users\old', r'D:\new')]),
+                         r'D:\new\file')
+        self.assertEqual(h.map_path(r'\\?\UNC\server\share\file', [(r'\\server\share', r'D:\new')]),
+                         r'D:\new\file')
+
+    def test_roundtrip_extended_rollout_and_compressed_history(self):
+        original = self.a.home/'sessions/2026/one.jsonl'
+        compressed = original.with_suffix('.jsonl.zst')
+        original.rename(compressed)
+        content = compressed.read_bytes()
+        with database(self.a.home/'state_5.sqlite') as c:
+            c.execute('UPDATE threads SET rollout_path=?,cwd=?',
+                      ('\\\\?\\' + str(original), '\\\\?\\' + str(Path(self.a.profile)/'project')))
+        self.a.export(self.store)
+        self.b.receive(self.store, True)
+        with database(self.b.home/'state_5.sqlite') as c:
+            cwd, rollout = c.execute('SELECT cwd,rollout_path FROM threads').fetchone()
+        self.assertEqual(Path(cwd), Path(self.b.profile)/'project')
+        self.assertEqual(Path(rollout), self.b.home/'sessions/2026/one.jsonl')
+        self.assertEqual(content, (self.b.home/'sessions/2026/one.jsonl.zst').read_bytes())
 
     def test_divergence_refused_and_stale_export_refused(self):
         self.a.export(self.store)
@@ -231,15 +263,6 @@ class HandoffTests(unittest.TestCase):
         e = next(e for e in m['files'] if e['path'] == 'state_5.sqlite')
         self.assertNotIn(b'SECRET-REMOTE-TOKEN-12345', h.Store(self.store).object(e['sha256']).read_bytes())
 
-    def test_process_guard_and_own_binary(self):
-        result = type('Result', (), {'stdout': b'"Codex.exe","12","Console","1","100 K"\r\n'})()
-        with patch.object(h.subprocess, 'run', return_value=result):
-            with self.assertRaises(h.HandoffError):
-                h.offline_guard()
-        result.stdout = b'"CodexHandoff.exe","12","Console","1","100 K"\r\n'
-        with patch.object(h.subprocess, 'run', return_value=result):
-            h.offline_guard()
-
     def test_store_and_project_overlap_refused(self):
         with self.assertRaises(h.HandoffError):
             self.a.export(self.a.home / 'transfer')
@@ -247,6 +270,78 @@ class HandoffTests(unittest.TestCase):
         project.mkdir()
         with self.assertRaises(h.HandoffError):
             self.a.export(project / 'transfer', [project])
+
+
+class ProcessGuardTests(unittest.TestCase):
+    def check(self, rows, paths):
+        result = subprocess.CompletedProcess([], 0, stdout=rows.encode('mbcs'))
+        with patch.object(h.subprocess, 'run', return_value=result), \
+                patch.object(h, 'process_image_path', side_effect=paths):
+            h.offline_guard()
+
+    def test_standalone_chatgpt_startup_does_not_block(self):
+        for path in [r'C:\Program Files\WindowsApps\OpenAI.ChatGPT-Desktop_1.0_x64__abc\app\ChatGPT.exe',
+                     r'C:\Program Files\WindowsApps\OpenAI.ChatGPT_1.0_x64__abc\app\ChatGPT.exe',
+                     r'C:\Users\用户\AppData\Local\Programs\ChatGPT\ChatGPT.exe']:
+            with self.subTest(path=path):
+                self.check('"ChatGPT.exe","12"\n"ChatGPT.exe","13"', [path, path])
+
+    def test_codex_disguised_as_chatgpt_blocks_with_identity(self):
+        path = r'C:\Program Files\WindowsApps\OpenAI.Codex_26.1_x64__abc\app\ChatGPT.exe'
+        with self.assertRaises(h.HandoffError) as caught:
+            self.check('"ChatGPT.exe","12"', [path])
+        self.assertIn('Codex 仍在运行', str(caught.exception))
+        self.assertIn('PID 12', str(caught.exception))
+        self.assertIn(path, str(caught.exception))
+
+    def test_legacy_codex_install_and_case_insensitive_paths(self):
+        path = r'C:\Users\user\AppData\Local\OpenAI\CODEX\app\CHATGPT.EXE'
+        with self.assertRaisesRegex(h.HandoffError, 'Codex 仍在运行'):
+            self.check('"CHATGPT.EXE","12"', [path])
+
+    def test_codex_path_takes_priority_over_chatgpt_folder(self):
+        path = r'C:\OpenAI\Codex\ChatGPT\ChatGPT.exe'
+        with self.assertRaises(h.HandoffError):
+            self.check('"ChatGPT.exe","12"', [path])
+
+    def test_all_codex_process_names_block(self):
+        for name in ['Codex.exe', 'codex-cli.exe', 'codex-app.exe',
+                     'codex-desktop.exe', 'codex-executor.exe']:
+            with self.subTest(name=name), self.assertRaises(h.HandoffError):
+                self.check(f'"{name}","12"', [rf'C:\apps\{name}'])
+
+    def test_chatgpt_does_not_hide_active_codex(self):
+        with self.assertRaises(h.HandoffError):
+            self.check('"ChatGPT.exe","12"\n"codex.exe","13"',
+                       [r'C:\apps\ChatGPT\ChatGPT.exe', r'C:\apps\codex.exe'])
+
+    def test_unknown_chatgpt_install_is_explained(self):
+        with self.assertRaisesRegex(h.HandoffError, '无法确认'):
+            self.check('"ChatGPT.exe","12"', [r'C:\unknown\ChatGPT.exe'])
+
+    def test_unreadable_path_does_not_disable_guard(self):
+        with self.assertRaisesRegex(h.HandoffError, '无法读取程序路径'):
+            self.check('"ChatGPT.exe","12"', [PermissionError('access denied')])
+        with self.assertRaisesRegex(h.HandoffError, 'Codex 仍在运行'):
+            self.check('"codex.exe","12"', [PermissionError('access denied')])
+
+    def test_exited_process_is_ignored(self):
+        self.check('"ChatGPT.exe","12"\n"codex.exe","13"', [None, None])
+
+    def test_own_binary_sandbox_service_and_empty_list_allowed(self):
+        self.check('"CodexHandoff.exe","12"\n"codex-windows-sandbox-service.exe","13"', [])
+        self.check('', [])
+
+    def test_process_scan_failure_is_explained(self):
+        for error in [OSError('not found'), subprocess.TimeoutExpired('tasklist', 10),
+                      subprocess.CalledProcessError(1, 'tasklist')]:
+            with self.subTest(error=error), patch.object(h.subprocess, 'run', side_effect=error):
+                with self.assertRaisesRegex(h.HandoffError, '无法检查运行中的程序'):
+                    h.offline_guard()
+
+    def test_malformed_candidate_is_not_silently_allowed(self):
+        with self.assertRaisesRegex(h.HandoffError, '进程检查结果无效'):
+            self.check('"ChatGPT.exe","unknown"', [])
 
 
 if __name__ == '__main__':

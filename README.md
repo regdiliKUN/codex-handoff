@@ -4,9 +4,9 @@
 
 面向两台 **Windows x64** 电脑轮流使用的本地 Codex 聊天交接工具。提供中文图形界面、醒目的开始按钮、自动备份和文件校验；便携版双击运行，无需安装 Python。
 
-[下载 Windows 便携版](https://github.com/regdiliKUN/codex-handoff/releases/download/v1.1.0/CodexHandoff-v1.1.0-windows-x64.zip) · [发布说明](https://github.com/regdiliKUN/codex-handoff/releases/tag/v1.1.0) · [详细使用说明](docs/使用说明.md)
+[下载 Windows 便携版](https://github.com/regdiliKUN/codex-handoff/releases/download/v1.1.2/CodexHandoff-v1.1.2-windows-x64.zip) · [发布说明](https://github.com/regdiliKUN/codex-handoff/releases/tag/v1.1.2) · [详细使用说明](docs/使用说明.md)
 
-> **v1.1.0 预发布版**：24 项隔离测试通过；尚未完成第二台实体电脑上的原聊天续聊验收。这是第三方辅助工具，不是 OpenAI 官方同步功能。第一次请先备份，再做 A → B → A 往返验证。
+> **v1.1.2 预发布版**：修复跨电脑接收后部分历史打不开的扩展路径问题，以及普通 ChatGPT 后台进程误拦截。37 项隔离测试通过；尚未完成第二台实体电脑上的原聊天续聊验收。这是第三方辅助工具，不是 OpenAI 官方同步功能。第一次请先备份，再做 A → B → A 往返验证。
 
 ## 三步开始
 
@@ -36,7 +36,7 @@ flowchart LR
 
 1. 两台电脑安装相同版本的 Codex，并分别登录同一个账号。
 2. 下载 ZIP 并解压，双击 `CodexHandoff.exe`。
-3. 在 A 退出 Codex、ChatGPT 桌面程序和 CLI，然后导出到中转文件夹。
+3. 在 A 完全退出 Codex（包括托盘后台）和所有 Codex CLI，然后导出到中转文件夹。普通 ChatGPT 可以保留运行。
 4. **等待所有文件同步或复制结束**，再到 B 退出 Codex并接收。
 5. B 打开一条旧聊天，发送验证消息；然后 B 导出、A 接收，确认可以往返续聊。
 
@@ -65,7 +65,7 @@ py -3.12 handoff.py
 py -3.12 -m unittest discover -s tests -p "test_*.py" -v
 ```
 
-测试仅使用隔离的临时目录和模拟界面引擎，不操作你的真实聊天。18 项交接引擎测试与 6 项界面测试均已通过；完整边界见[验证记录](docs/验证记录.md)。
+测试仅使用隔离的临时目录和模拟界面引擎，不操作你的真实聊天。37 项交接引擎、进程识别与界面测试均已通过；包含扩展路径和压缩记录的迁移回归，完整边界见[验证记录](docs/验证记录.md)。
 
 ## 构建便携版
 
