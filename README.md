@@ -65,7 +65,9 @@ py -3.12 handoff.py
 py -3.12 -m unittest discover -s tests -p "test_*.py" -v
 ```
 
-测试仅使用隔离的临时目录和模拟界面引擎，不操作你的真实聊天。37 项交接引擎、进程识别与界面测试均已通过；包含扩展路径和压缩记录的迁移回归，完整边界见[验证记录](docs/验证记录.md)。
+测试仅使用隔离的临时目录和模拟界面引擎，不操作你的真实聊天。108 项测试（引擎 79、界面 25、构建/校验 4）均已通过，完整边界见[验证记录](docs/验证记录.md)，逐轮改动见[迭代记录](docs/迭代记录.md)。
+
+> 测试的临时目录建在 `tests/` 旁边。程序会拒绝位于 `%LOCALAPPDATA%`、`%APPDATA%`、用户主目录等受保护位置的项目文件夹，所以请把仓库放在这些目录之外（例如 `D:\src\codex-handoff`）再跑测试，否则约 8 项会因"项目文件夹不能位于……系统目录内"而失败。
 
 ## 构建便携版
 
@@ -73,7 +75,7 @@ py -3.12 -m unittest discover -s tests -p "test_*.py" -v
 .\build.ps1
 ```
 
-构建脚本在项目内创建 `.venv`，安装固定版本的 PyInstaller，将图形程序打包到 `dist/CodexHandoff.exe`。源代码运行不依赖第三方 Python 库。
+构建脚本在项目内创建 `.venv`，安装固定版本的 PyInstaller，再调用 `build_exe.py`：写入与 `handoff.VERSION` 一致的版本资源和图标，打包后运行 EXE 自检，产物为仓库根目录的 `CodexHandoff.exe`。源代码运行不依赖第三方 Python 库。
 
 ## 数据位置
 

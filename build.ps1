@@ -7,8 +7,6 @@ if (-not (Test-Path -LiteralPath '.venv\Scripts\python.exe')) {
 $taskPython = Join-Path $PSScriptRoot '.venv\Scripts\python.exe'
 & $taskPython -m pip install -r requirements-build.txt
 if ($LASTEXITCODE -ne 0) { throw 'Build dependency installation failed.' }
-$taskResources = Join-Path $PSScriptRoot 'resources'
-$taskIcon = Join-Path $taskResources 'handoff.ico'
-& $taskPython -m PyInstaller --noconfirm --onefile --windowed --name CodexHandoff --icon $taskIcon --add-data ($taskResources + ';resources') handoff.py
+& $taskPython build_exe.py --python $taskPython
 if ($LASTEXITCODE -ne 0) { throw 'Executable build failed.' }
-Write-Output 'Ready: dist/CodexHandoff.exe'
+Write-Output 'Ready: CodexHandoff.exe'
