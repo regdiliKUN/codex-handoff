@@ -4,9 +4,9 @@
 
 面向两台 **Windows x64** 电脑轮流使用的本地 Codex 聊天交接工具。提供中文图形界面、醒目的开始按钮、自动备份和文件校验；便携版双击运行，无需安装 Python。
 
-[下载 Windows 便携版](https://github.com/regdiliKUN/codex-handoff/releases/download/v1.1.2/CodexHandoff-v1.1.2-windows-x64.zip) · [发布说明](https://github.com/regdiliKUN/codex-handoff/releases/tag/v1.1.2) · [详细使用说明](docs/使用说明.md)
+[下载 Windows 便携版](https://github.com/regdiliKUN/codex-handoff/releases/download/v1.2.0/codex-handoff-1.2.0-win-x64.zip) · [发布说明](https://github.com/regdiliKUN/codex-handoff/releases/tag/v1.2.0) · [详细使用说明](docs/使用说明.md)
 
-> **v1.1.2 预发布版**：修复跨电脑接收后部分历史打不开的扩展路径问题，以及普通 ChatGPT 后台进程误拦截。37 项隔离测试通过；尚未完成第二台实体电脑上的原聊天续聊验收。这是第三方辅助工具，不是 OpenAI 官方同步功能。第一次请先备份，再做 A → B → A 往返验证。
+> **v1.2.0**：在 1.1.2 基础上加强迁移包校验（清单字段、文件数量与大小、路径、链接 / 目录联接）和目标目录清理，内容没变的重复导出直接复用最新快照，并新增 `--version`、`--self-test`、`--diagnose`、`--verify-store` 命令行自检。随包测试 108 项通过；尚未完成第二台实体电脑上的原聊天续聊验收。这是第三方辅助工具，不是 OpenAI 官方同步功能。第一次请先备份，再做 A → B → A 往返验证。
 
 ## 三步开始
 
@@ -82,3 +82,7 @@ py -3.12 -m unittest discover -s tests -p "test_*.py" -v
 - 中转目录：由你在图形界面中选择；历史对象不会自动清理。
 
 本仓库和发行包仅包含程序与说明，不包含任何用户聊天、登录信息或迁移快照。反馈问题时，请先移除聊天原文、凭据和私有路径。
+
+## 许可
+
+MIT，见 [LICENSE](LICENSE)。
