@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+from datetime import datetime
 from pathlib import Path
 import queue
 import socket
@@ -23,17 +24,100 @@ RED = "#B43A47"
 FONT = "Microsoft YaHei UI"
 
 
+def h_inside(a, b):
+    try:
+        Path(a).resolve().relative_to(Path(b).resolve())
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def normalize_store_path(text):
+    text = str(text).strip().strip('"').strip("'").strip()
+    text = os.path.expandvars(os.path.expanduser(text))
+    if not text:
+        raise ValueError("请先选择中转文件夹。")
+    try:
+        p = Path(text)
+    except (OSError, ValueError) as exc:
+        raise ValueError("中转文件夹路径格式无效。") from exc
+    if not p.is_absolute():
+        raise ValueError("请填写完整的中转文件夹路径，例如 D:\\同步\\Codex交接数据。")
+    if p.is_symlink():
+        raise ValueError("中转文件夹不能是符号链接或目录联接，请选择真实文件夹。")
+    if p.exists() and not p.is_dir():
+        raise ValueError("中转位置不是文件夹。")
+    try:
+        return str(p.resolve())
+    except OSError as exc:
+        raise ValueError("无法解析中转文件夹路径，请检查磁盘是否可用。") from exc
+
+
+def enable_high_dpi():
+    """Ask Windows for crisp text before Tk creates any window."""
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+    except ImportError:
+        return False
+    try:
+        if ctypes.windll.shcore.SetProcessDpiAwareness(1) == 0:
+            return True
+    except Exception:
+        pass
+    try:
+        return bool(ctypes.windll.user32.SetProcessDPIAware())
+    except Exception:
+        return False
+
+
+def human_size(value):
+    value = float(value or 0)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if value < 1024 or unit == "TiB":
+            return (f"{value:.0f} {unit}" if unit == "B" else f"{value:.1f} {unit}")
+        value /= 1024
+    return f"{value:.1f} TiB"
+
+
+def path_preview(values, limit=8):
+    paths = [str(v) for v in values]
+    if len(paths) <= limit:
+        return "\n".join(paths)
+    return "\n".join(paths[:limit]) + f"\n……另有 {len(paths) - limit} 个目标目录"
+
+
 class HandoffApp:
     def __init__(self, root, api, engine=None):
         self.root, self.api = root, api
         self.engine = engine or api.Engine()
         self.events = queue.Queue()
         self.engine.log = lambda text: self.events.put(("log", text))
+        self.engine.progress = lambda done, total: self.events.put(("progress", (done, total)))
         self.settings_path = self.engine.data / "settings.json"
-        settings = api.read_json(self.settings_path) if self.settings_path.exists() else {}
-        self.mode = tk.StringVar(root, value="export")
-        self.store = tk.StringVar(root, value=settings.get("store", ""))
-        self.projects = list(self.engine.state().get("projects", settings.get("projects", [])))
+        self.settings_error = None
+        self.state_warning = None
+        try:
+            settings = api.read_json(self.settings_path) if self.settings_path.exists() else {}
+            if not isinstance(settings, dict):
+                raise ValueError("settings is not an object")
+        except Exception as exc:
+            settings = {}
+            self.settings_error = str(exc)
+        mode = settings.get("mode")
+        if mode not in {"export", "receive"}:
+            mode = "export"
+        self.mode = tk.StringVar(root, value=mode)
+        store = settings.get("store", "")
+        self.store = tk.StringVar(root, value=store if isinstance(store, str) else "")
+        try:
+            state_projects = self.engine.state().get("projects", [])
+        except Exception as exc:
+            state_projects = None
+            self.state_warning = str(exc)
+        projects = state_projects if isinstance(state_projects, list) else settings.get("projects", [])
+        self.projects = [p for p in projects if isinstance(p, str)] if isinstance(projects, list) else []
         self.busy = False
         self.count = 0
         self.project_open = False
@@ -61,8 +145,34 @@ class HandoffApp:
         self.mode.trace_add("write", lambda *_: self.update_mode())
         self.store.trace_add("write", lambda *_: self.folder_changed())
         self.update_mode()
+        if self.settings_error:
+            self.append_log("已忽略损坏的设置：" + self.settings_error)
+            self.toggle_details()
+        elif self.state_warning:
+            self.append_log("本机交接状态暂时不可读，已改用上次保存的项目列表：" + self.state_warning)
+            self.toggle_details()
         self.root.protocol("WM_DELETE_WINDOW", self.close)
+        self.root.bind("<Return>", self.keyboard_start)
+        self.root.bind("<Control-o>", lambda _: self.choose_store())
+        self.root.bind_all("<Alt-Key-1>", lambda _: self.set_mode("export"))
+        self.root.bind_all("<Alt-Key-2>", lambda _: self.set_mode("receive"))
+        self.root.bind("<F1>", lambda _: self.toggle_details())
         self.poll_id = self.root.after(80, self.poll)
+
+    def set_mode(self, mode):
+        if not self.busy and mode in {"export", "receive"}:
+            self.mode.set(mode)
+
+    def keyboard_start(self, event=None):
+        if self.busy:
+            return "break"
+        focus = self.root.focus_get()
+        # Buttons already invoke themselves on Return. Handling the key twice
+        # could open two confirmation dialogs before the busy flag is set.
+        if isinstance(focus, (tk.Text, tk.Listbox, tk.Button)):
+            return None
+        self.start_selected()
+        return "break"
 
     def label(self, parent, text="", size=14, bold=False, fg=INK, bg=WHITE, **kw):
         return tk.Label(parent, text=text, font=(FONT, -size, "bold" if bold else "normal"),
@@ -226,6 +336,12 @@ class HandoffApp:
         self.log = tk.Text(self.details_frame, height=5, state="disabled", wrap="word", bg="#EAF0F8",
                            fg=MUTED, font=(FONT, -12), relief="flat", padx=10, pady=8)
         self.log.pack(fill="x")
+        log_actions = tk.Frame(self.details_frame, bg=BG)
+        log_actions.pack(fill="x", pady=(6, 0))
+        self.copy_button = self.button(log_actions, "复制日志", self.copy_log, pady=4)
+        self.copy_button.pack(side="left")
+        self.copy_hint = self.label(log_actions, "", 12, fg=GREEN, bg=BG)
+        self.copy_hint.pack(side="left", padx=(8, 0))
 
     def mousewheel(self, event):
         # Scroll only the middle area; the primary action is fixed and always visible.
@@ -251,7 +367,7 @@ class HandoffApp:
 
     def set_status(self, title, detail, color=INK):
         self.status_title.configure(text=title, fg=color)
-        self.status_detail.configure(text=detail[:240])
+        self.status_detail.configure(text=detail)
 
     def folder_changed(self):
         self.store_entry.configure(highlightbackground=BORDER)
@@ -292,9 +408,38 @@ class HandoffApp:
 
     def add_project(self):
         folder = filedialog.askdirectory(parent=self.root, title="选择具体项目目录")
-        if folder and folder not in self.projects:
-            self.projects.append(folder)
-            self.refresh_projects()
+        if not folder:
+            return
+        try:
+            candidate = Path(folder).resolve()
+            if not candidate.is_dir():
+                raise ValueError("所选路径不是文件夹。")
+            if candidate == self.engine.home or h_inside(candidate, self.engine.home) or h_inside(self.engine.home, candidate):
+                raise ValueError("项目不能是 Codex 数据目录或它的上级目录。")
+            store = None
+            if self.store.get().strip():
+                try:
+                    store = Path(normalize_store_path(self.store.get()))
+                except ValueError:
+                    # A malformed store path is reported when starting; it must
+                    # not prevent the user from editing the project list.
+                    store = None
+            if store and (h_inside(candidate, store) or h_inside(store, candidate)):
+                raise ValueError("项目不能与中转文件夹重叠。")
+            key = os.path.normcase(str(candidate))
+            for existing in self.projects:
+                old = Path(existing).resolve()
+                if key == os.path.normcase(str(old)) or h_inside(candidate, old) or h_inside(old, candidate):
+                    raise ValueError("请勿添加重复项目，或项目与其子目录。")
+        except (OSError, ValueError) as exc:
+            self.project_summary.configure(text=str(exc), fg=RED)
+            self.append_log("无法添加项目：" + str(exc))
+            if not self.project_open:
+                self.toggle_projects()
+            return
+        self.projects.append(str(candidate))
+        self.refresh_projects()
+        self.project_summary.configure(fg=MUTED)
 
     def remove_project(self):
         for i in reversed(self.project_list.curselection()):
@@ -315,34 +460,55 @@ class HandoffApp:
         if self.busy:
             return
         try:
-            path = self.store.get().strip()
-            if action != "restore" and not path:
+            raw = self.store.get().strip()
+            if action != "restore" and not raw:
                 self.store_entry.configure(highlightbackground=RED)
                 self.folder_hint.configure(text="请点击“选择文件夹”，先选好中转位置。", fg=RED)
                 self.set_status("还差一步：选择中转文件夹", "选好位置后，点击下方大按钮开始。", AMBER)
                 self.canvas.yview_moveto(0)
                 self.store_entry.focus_set()
                 return
+            path = normalize_store_path(raw) if action != "restore" else raw
+            if action != "restore" and path != self.store.get():
+                self.store.set(path)
             self.engine.guard()
             allow = False
             if action == "receive":
                 store = self.api.Store(path)
                 manifest = store.load()
                 destinations = self.engine.destinations(manifest)
-                preview = "\n".join(str(v) for v in destinations.values())
-                allow = messagebox.askyesno("确认接收聊天", f"来源电脑：{manifest['computer']}\n导出时间：{manifest['created']}\n\n工具将先备份，再替换以下范围内的聊天和项目文件：\n{preview}\n\n项目中快照没有的文件也会被删除。\n确认两台 Codex 版本相同、文件已同步完成，现在接收？", parent=self.root)
+                preview = path_preview(destinations.values())
+                created = manifest.get("created", "")
+                try:
+                    created = datetime.fromisoformat(created).astimezone().strftime("%Y-%m-%d %H:%M:%S")
+                except (TypeError, ValueError):
+                    pass
+                projects = [k for k in manifest.get("roots", {}) if k != "codex"]
+                allow = messagebox.askyesno(
+                    "确认接收聊天",
+                    f"来源电脑：{manifest['computer']}\n"
+                    f"导出时间：{created}\n"
+                    f"快照文件：{len(manifest['files'])} 个 · 项目：{len(projects)} 个\n\n"
+                    f"工具将先备份，再替换以下范围内的聊天和项目文件：\n{preview}\n\n"
+                    "项目中快照没有的文件也会被删除。\n"
+                    "确认两台 Codex 版本相同、文件已同步完成，现在接收？",
+                    parent=self.root)
                 if not allow:
                     self.set_status("已取消，文件没有改动", "准备好后可再次点击“开始接收聊天”。")
                     return
             if action == "restore" and not messagebox.askyesno("恢复上次备份", "恢复最近一次操作前的聊天和项目文件？当前内容会先备份（中断恢复除外）。", parent=self.root):
                 return
-            self.api.atomic_json(self.settings_path, {"store": path, "projects": self.projects})
         except Exception as exc:
             self.append_log(str(exc))
             self.set_status("暂时无法开始", str(exc), AMBER)
             if not self.details_open:
                 self.toggle_details()
             return
+        try:
+            self.api.atomic_json(self.settings_path, {"store": path, "projects": self.projects,
+                                                      "mode": self.mode.get()})
+        except Exception as exc:
+            self.append_log("设置未能保存，但不影响本次交接：" + str(exc))
         self.busy = True
         self.count = 0
         self.update_controls()
@@ -357,12 +523,19 @@ class HandoffApp:
             try:
                 if action == "export":
                     result = self.engine.export(path, projects)
-                    result_message = ("导出完成", f"共 {len(result['files'])} 个文件。等待中转目录同步完成，再到另一台电脑选择“接收”。")
+                    size = sum(e.get("size", 0) for e in result.get("files", []) if isinstance(e, dict))
+                    result_message = ("导出完成", f"共 {len(result['files'])} 个文件，约 {human_size(size)}。"
+                                                 "等待中转目录同步完成，再到另一台电脑选择“接收”。")
                 elif action == "receive":
                     state, _ = self.engine.receive(path, allow_initial_replace=allow)
                     result_message = (("已经是最新快照", "无需重复接收，可打开 Codex 继续聊天。") if state == "already"
                                       else ("聊天已接收", "现在可以打开 Codex，检查旧聊天和项目文件，再在原聊天里继续。"))
-                    self.events.put(("projects", self.engine.state().get("projects", [])))
+                    try:
+                        refreshed = self.engine.state().get("projects", [])
+                    except Exception as exc:
+                        self.events.put(("log", "聊天已接收，但读取项目列表失败：" + str(exc)))
+                    else:
+                        self.events.put(("projects", refreshed))
                 else:
                     self.engine.restore()
                     result_message = ("备份已恢复", "现在可以打开 Codex，检查恢复后的聊天和项目。")
@@ -378,6 +551,13 @@ class HandoffApp:
             self.log.delete("1.0", "501.0")
         self.log.see("end")
         self.log.configure(state="disabled")
+
+    def copy_log(self):
+        text = self.log.get("1.0", "end-1c")
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        self.root.update_idletasks()
+        self.copy_hint.configure(text="已复制到剪贴板")
 
     def poll(self):
         if self.closed:
@@ -396,10 +576,18 @@ class HandoffApp:
                 self.projects[:] = message
                 self.project_list.configure(state="normal")
                 self.refresh_projects()
+            elif kind == "progress":
+                done, total = message
+                if self.busy:
+                    percent = round(done * 100 / total) if total else 0
+                    self.progress.stop()
+                    self.progress.configure(mode="determinate", maximum=max(1, total), value=done)
+                    self.status_detail.configure(
+                        text=f"已处理 {done} / {total} 个文件（{percent}%）· 请勿启动 Codex 或修改项目文件。")
             else:
                 self.busy = False
                 self.progress.stop()
-                self.progress.configure(mode="determinate", value=100 if kind == "done" else 0)
+                self.progress.configure(mode="determinate", maximum=100, value=100 if kind == "done" else 0)
                 self.update_mode()
                 if kind == "done":
                     self.set_status(message[0] + "  ✓", message[1], GREEN)
@@ -413,7 +601,8 @@ class HandoffApp:
 
     def report(self):
         self.root.update_idletasks()
-        return {"title": self.root.title(), "requested_width": self.root.winfo_reqwidth(),
+        return {"title": self.root.title(), "version": self.api.VERSION, "mode": self.mode.get(),
+                "requested_width": self.root.winfo_reqwidth(),
                 "requested_height": self.root.winfo_reqheight(), "primary_action": self.start_button.cget("text"),
                 "primary_color": self.start_button.cget("bg"), "directions": list(self.cards),
                 "primary_action_pinned_to_footer": True}
